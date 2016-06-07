@@ -3,9 +3,10 @@ package mongoimport
 import (
 	"bufio"
 	"fmt"
-	"gopkg.in/mgo.v2/bson"
 	"io"
 	"strings"
+
+	"gopkg.in/mgo.v2/bson"
 )
 
 const (
@@ -16,8 +17,8 @@ const (
 // TSVInputReader is a struct that implements the InputReader interface for a
 // TSV input source.
 type TSVInputReader struct {
-	// fields is a list of field names in the BSON documents to be imported
-	fields []string
+	// colSpecs is a list of column specifications in the BSON documents to be imported
+	colSpecs []ColumnSpec
 
 	// tsvReader is the underlying reader used to read data in from the TSV
 	// or TSV file
@@ -38,17 +39,17 @@ type TSVInputReader struct {
 
 // TSVConverter implements the Converter interface for TSV input.
 type TSVConverter struct {
-	fields []string
-	data   string
-	index  uint64
+	colSpecs []ColumnSpec
+	data     string
+	index    uint64
 }
 
 // NewTSVInputReader returns a TSVInputReader configured to read input from the
-// given io.Reader, extracting the specified fields only.
-func NewTSVInputReader(fields []string, in io.Reader, numDecoders int) *TSVInputReader {
+// given io.Reader, extracting the specified columns only.
+func NewTSVInputReader(colSpecs []ColumnSpec, in io.Reader, numDecoders int) *TSVInputReader {
 	szCount := newSizeTrackingReader(newBomDiscardingReader(in))
 	return &TSVInputReader{
-		fields:       fields,
+		colSpecs:     colSpecs,
 		tsvReader:    bufio.NewReader(szCount),
 		numProcessed: uint64(0),
 		numDecoders:  numDecoders,
@@ -64,9 +65,30 @@ func (r *TSVInputReader) ReadAndValidateHeader() (err error) {
 		return err
 	}
 	for _, field := range strings.Split(header, tokenSeparator) {
-		r.fields = append(r.fields, strings.TrimRight(field, "\r\n"))
+		r.colSpecs = append(r.colSpecs, ColumnSpec{
+			Name:   strings.TrimRight(field, "\r\n"),
+			Parser: new(FieldAutoParser),
+		})
 	}
-	return validateReaderFields(r.fields)
+	return validateReaderFields(ColumnNames(r.colSpecs))
+}
+
+// ReadAndValidateTypedHeader reads the header from the underlying reader and validates
+// the header fields. It sets err if the read/validation fails.
+func (r *TSVInputReader) ReadAndValidateTypedHeader(parseGrace ParseGrace) (err error) {
+	header, err := r.tsvReader.ReadString(entryDelimiter)
+	if err != nil {
+		return err
+	}
+	var headerFields []string
+	for _, field := range strings.Split(header, tokenSeparator) {
+		headerFields = append(headerFields, strings.TrimRight(field, "\r\n"))
+	}
+	r.colSpecs, err = ParseTypedHeaders(headerFields, parseGrace)
+	if err != nil {
+		return err
+	}
+	return validateReaderFields(ColumnNames(r.colSpecs))
 }
 
 // StreamDocument takes a boolean indicating if the documents should be streamed
@@ -92,9 +114,9 @@ func (r *TSVInputReader) StreamDocument(ordered bool, readDocs chan bson.D) (ret
 				return
 			}
 			tsvRecordChan <- TSVConverter{
-				fields: r.fields,
-				data:   r.tsvRecord,
-				index:  r.numProcessed,
+				colSpecs: r.colSpecs,
+				data:     r.tsvRecord,
+				index:    r.numProcessed,
 			}
 			r.numProcessed++
 		}
@@ -112,7 +134,7 @@ func (r *TSVInputReader) StreamDocument(ordered bool, readDocs chan bson.D) (ret
 // TSVConverter struct to a BSON document.
 func (c TSVConverter) Convert() (bson.D, error) {
 	return tokensToBSON(
-		c.fields,
+		c.colSpecs,
 		strings.Split(strings.TrimRight(c.data, "\r\n"), tokenSeparator),
 		c.index,
 	)

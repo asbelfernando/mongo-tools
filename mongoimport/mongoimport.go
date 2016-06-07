@@ -74,6 +74,11 @@ type InputReader interface {
 	// nil otherwise. No-op for JSON input readers.
 	ReadAndValidateHeader() error
 
+	// ReadAndValidateTypedHeader is the same as ReadAndValidateHeader,
+	// except it also parses types from the fields of the header. Parse errors
+	// will be handled according parseGrace.
+	ReadAndValidateTypedHeader(parseGrace ParseGrace) error
+
 	// embedded io.Reader that tracks number of bytes read, to allow feeding into progress bar.
 	sizeTracker
 }
@@ -125,6 +130,10 @@ func (imp *MongoImport) ValidateSettings(args []string) error {
 			if imp.InputOptions.FieldFile != nil {
 				return fmt.Errorf("incompatible options: --fieldFile and --headerline")
 			}
+		}
+
+		if _, err := ValidatePG(imp.InputOptions.ParseGrace); err != nil {
+			return err
 		}
 	} else {
 		// input type is JSON
@@ -266,7 +275,12 @@ func (imp *MongoImport) ImportDocuments() (uint64, error) {
 	}
 
 	if imp.InputOptions.HeaderLine {
-		if err = inputReader.ReadAndValidateHeader(); err != nil {
+		if imp.InputOptions.ColumnsHaveTypes {
+			err = inputReader.ReadAndValidateTypedHeader(ParsePG(imp.InputOptions.ParseGrace))
+		} else {
+			err = inputReader.ReadAndValidateHeader()
+		}
+		if err != nil {
 			return 0, err
 		}
 	}
@@ -492,30 +506,59 @@ func (up *upserter) Flush() error {
 	return nil
 }
 
+func splitInlineHeader(header string) (headers []string) {
+	var level uint8
+	var currentField string
+	for _, c := range header {
+		if c == '(' {
+			level++
+		} else if c == ')' && level > 0 {
+			level--
+		}
+		if c == ',' && level == 0 {
+			headers = append(headers, currentField)
+			currentField = ""
+		} else {
+			currentField = currentField + string(c)
+		}
+	}
+	headers = append(headers, currentField) // add last field
+	return
+}
+
 // getInputReader returns an implementation of InputReader based on the input type
 func (imp *MongoImport) getInputReader(in io.Reader) (InputReader, error) {
-	var fields []string
+	var colSpecs []ColumnSpec
+	var headers []string
 	var err error
 	if imp.InputOptions.Fields != nil {
-		fields = strings.Split(*imp.InputOptions.Fields, ",")
+		headers = splitInlineHeader(*imp.InputOptions.Fields)
 	} else if imp.InputOptions.FieldFile != nil {
-		fields, err = util.GetFieldsFromFile(*imp.InputOptions.FieldFile)
+		headers, err = util.GetFieldsFromFile(*imp.InputOptions.FieldFile)
 		if err != nil {
 			return nil, err
 		}
 	}
+	if imp.InputOptions.ColumnsHaveTypes {
+		colSpecs, err = ParseTypedHeaders(headers, ParsePG(imp.InputOptions.ParseGrace))
+		if err != nil {
+			return nil, err
+		}
+	} else {
+		colSpecs = ParseAutoHeaders(headers)
+	}
 
 	// header fields validation can only happen once we have an input reader
 	if !imp.InputOptions.HeaderLine {
-		if err = validateReaderFields(fields); err != nil {
+		if err = validateReaderFields(ColumnNames(colSpecs)); err != nil {
 			return nil, err
 		}
 	}
 
 	if imp.InputOptions.Type == CSV {
-		return NewCSVInputReader(fields, in, imp.ToolOptions.NumDecodingWorkers), nil
+		return NewCSVInputReader(colSpecs, in, imp.ToolOptions.NumDecodingWorkers), nil
 	} else if imp.InputOptions.Type == TSV {
-		return NewTSVInputReader(fields, in, imp.ToolOptions.NumDecodingWorkers), nil
+		return NewTSVInputReader(colSpecs, in, imp.ToolOptions.NumDecodingWorkers), nil
 	}
 	return NewJSONInputReader(imp.InputOptions.JSONArray, in, imp.ToolOptions.NumDecodingWorkers), nil
 }

@@ -4,18 +4,51 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
+	"io"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+
 	"github.com/mongodb/mongo-tools/common/bsonutil"
 	"github.com/mongodb/mongo-tools/common/db"
 	"github.com/mongodb/mongo-tools/common/log"
 	"github.com/mongodb/mongo-tools/common/util"
 	"gopkg.in/mgo.v2/bson"
 	"gopkg.in/tomb.v2"
-	"io"
-	"sort"
-	"strconv"
-	"strings"
-	"sync"
 )
+
+type ParseGrace int
+
+const (
+	PG_AUTO_CAST ParseGrace = iota
+	PG_SKIP_FIELD
+	PG_SKIP_ROW
+	PG_STOP
+)
+
+// ValidatePG ensures the user-provided parseGrace is one of the allowed
+// values.
+func ValidatePG(pg string) (ParseGrace, error) {
+	switch pg {
+	case "autoCast":
+		return PG_AUTO_CAST, nil
+	case "skipField":
+		return PG_SKIP_FIELD, nil
+	case "skipRow":
+		return PG_SKIP_ROW, nil
+	case "stop":
+		return PG_STOP, nil
+	default:
+		return PG_AUTO_CAST, fmt.Errorf("invalid parse grace: %s", pg)
+	}
+}
+
+// ParsePG interprets the user-provided parseGrace, assuming it is valid.
+func ParsePG(pg string) (res ParseGrace) {
+	res, _ = ValidatePG(pg)
+	return
+}
 
 // Converter is an interface that adds the basic Convert method which returns a
 // valid BSON document that has been converted by the underlying implementation.
@@ -169,22 +202,6 @@ func doSequentialStreaming(workers []*importWorker, readDocs chan Converter, out
 	}
 }
 
-// getParsedValue returns the appropriate concrete type for the given token
-// it first attempts to convert it to an int, if that doesn't succeed, it
-// attempts conversion to a float, if that doesn't succeed, it returns the
-// token as is.
-func getParsedValue(token string) interface{} {
-	parsedInt, err := strconv.Atoi(token)
-	if err == nil {
-		return parsedInt
-	}
-	parsedFloat, err := strconv.ParseFloat(token, 64)
-	if err == nil {
-		return parsedFloat
-	}
-	return token
-}
-
 // getUpsertValue takes a given BSON document and a given field, and returns the
 // field's associated value in the document. The field is specified using dot
 // notation for nested fields. e.g. "person.age" would return 34 would return
@@ -328,23 +345,37 @@ func streamDocuments(ordered bool, numDecoders int, readDocs chan Converter, out
 	return
 }
 
-// tokensToBSON reads in slice of records - along with ordered fields names -
+// tokensToBSON reads in slice of records - along with ordered column names -
 // and returns a BSON document for the record.
-func tokensToBSON(fields, tokens []string, numProcessed uint64) (bson.D, error) {
+func tokensToBSON(colSpecs []ColumnSpec, tokens []string, numProcessed uint64) (bson.D, error) {
 	log.Logf(log.DebugHigh, "got line: %v", tokens)
 	var parsedValue interface{}
 	document := bson.D{}
 	for index, token := range tokens {
-		parsedValue = getParsedValue(token)
-		if index < len(fields) {
-			if strings.Index(fields[index], ".") != -1 {
-				setNestedValue(fields[index], parsedValue, &document)
+		if index < len(colSpecs) {
+			parsedValue, err := colSpecs[index].Parser.Parse(token)
+			if err != nil {
+				switch colSpecs[index].ParseGrace {
+				case PG_AUTO_CAST:
+					parsedValue = autoParse(token)
+				case PG_SKIP_FIELD:
+					continue
+				case PG_SKIP_ROW:
+					return nil, nil
+				case PG_STOP:
+					return nil, fmt.Errorf("type coercion failure for field name %s on token %s in document #%v",
+						colSpecs[index].Name, token, numProcessed)
+				}
+			}
+			if strings.Index(colSpecs[index].Name, ".") != -1 {
+				setNestedValue(colSpecs[index].Name, parsedValue, &document)
 			} else {
-				document = append(document, bson.DocElem{fields[index], parsedValue})
+				document = append(document, bson.DocElem{colSpecs[index].Name, parsedValue})
 			}
 		} else {
+			parsedValue = autoParse(token)
 			key := "field" + strconv.Itoa(index)
-			if util.StringSliceContains(fields, key) {
+			if util.StringSliceContains(ColumnNames(colSpecs), key) {
 				return nil, fmt.Errorf("duplicate field name - on %v - for token #%v ('%v') in document #%v",
 					key, index+1, parsedValue, numProcessed)
 			}
@@ -423,6 +454,9 @@ func (iw *importWorker) processDocuments(ordered bool) error {
 			document, err := converter.Convert()
 			if err != nil {
 				return err
+			}
+			if document == nil {
+				continue
 			}
 			iw.processedDocumentChan <- document
 		case <-iw.tomb.Dying():

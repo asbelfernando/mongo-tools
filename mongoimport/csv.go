@@ -2,16 +2,16 @@ package mongoimport
 
 import (
 	"fmt"
+	"io"
+
 	"github.com/mongodb/mongo-tools/mongoimport/csv"
 	"gopkg.in/mgo.v2/bson"
-	"io"
 )
 
 // CSVInputReader implements the InputReader interface for CSV input types.
 type CSVInputReader struct {
-
-	// fields is a list of field names in the BSON documents to be imported
-	fields []string
+	// colSpecs is a list of column specifications in the BSON documents to be imported
+	colSpecs []ColumnSpec
 
 	// csvReader is the underlying reader used to read data in from the CSV or CSV file
 	csvReader *csv.Reader
@@ -31,21 +31,22 @@ type CSVInputReader struct {
 
 // CSVConverter implements the Converter interface for CSV input.
 type CSVConverter struct {
-	fields, data []string
-	index        uint64
+	colSpecs []ColumnSpec
+	data     []string
+	index    uint64
 }
 
 // NewCSVInputReader returns a CSVInputReader configured to read data from the
-// given io.Reader, extracting only the specified fields using exactly "numDecoders"
+// given io.Reader, extracting only the specified columns using exactly "numDecoders"
 // goroutines.
-func NewCSVInputReader(fields []string, in io.Reader, numDecoders int) *CSVInputReader {
+func NewCSVInputReader(colSpecs []ColumnSpec, in io.Reader, numDecoders int) *CSVInputReader {
 	szCount := newSizeTrackingReader(newBomDiscardingReader(in))
 	csvReader := csv.NewReader(szCount)
-	// allow variable number of fields in document
+	// allow variable number of colSpecs in document
 	csvReader.FieldsPerRecord = -1
 	csvReader.TrimLeadingSpace = true
 	return &CSVInputReader{
-		fields:       fields,
+		colSpecs:     colSpecs,
 		csvReader:    csvReader,
 		numProcessed: uint64(0),
 		numDecoders:  numDecoders,
@@ -60,8 +61,22 @@ func (r *CSVInputReader) ReadAndValidateHeader() (err error) {
 	if err != nil {
 		return err
 	}
-	r.fields = fields
-	return validateReaderFields(r.fields)
+	r.colSpecs = ParseAutoHeaders(fields)
+	return validateReaderFields(ColumnNames(r.colSpecs))
+}
+
+// ReadAndValidateHeader reads the header from the underlying reader and validates
+// the header fields. It sets err if the read/validation fails.
+func (r *CSVInputReader) ReadAndValidateTypedHeader(parseGrace ParseGrace) (err error) {
+	fields, err := r.csvReader.Read()
+	if err != nil {
+		return err
+	}
+	r.colSpecs, err = ParseTypedHeaders(fields, parseGrace)
+	if err != nil {
+		return err
+	}
+	return validateReaderFields(ColumnNames(r.colSpecs))
 }
 
 // StreamDocument takes a boolean indicating if the documents should be streamed
@@ -87,9 +102,9 @@ func (r *CSVInputReader) StreamDocument(ordered bool, readDocs chan bson.D) (ret
 				return
 			}
 			csvRecordChan <- CSVConverter{
-				fields: r.fields,
-				data:   r.csvRecord,
-				index:  r.numProcessed,
+				colSpecs: r.colSpecs,
+				data:     r.csvRecord,
+				index:    r.numProcessed,
 			}
 			r.numProcessed++
 		}
@@ -106,7 +121,7 @@ func (r *CSVInputReader) StreamDocument(ordered bool, readDocs chan bson.D) (ret
 // CSVConverter struct to a BSON document.
 func (c CSVConverter) Convert() (bson.D, error) {
 	return tokensToBSON(
-		c.fields,
+		c.colSpecs,
 		c.data,
 		c.index,
 	)
